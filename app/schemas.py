@@ -86,6 +86,13 @@ class PlanOut(BaseModel):
     plan: list[str] = Field(..., description="总费用最低的待调新区编码（有序）")
     total_fee: int
     registered: list[RegisteredNewOut]
+    retrieved_new: list[str] = Field(
+        ...,
+        description="已查回档案的新区（含查回数全为 0 的档案）；这些新区不在 plan 中",
+    )
+    unretrieved_new: list[str] = Field(
+        ..., description="尚未查回档案的新区；注意与「已查回但计数为 0」不同"
+    )
     old_remaining: dict[str, int]
     message: str
 
@@ -104,6 +111,12 @@ class AccountingOut(BaseModel):
     total_completed: int | None = None
     plan: list[str] | None = None
     total_fee: int | None = None
+    retrieved_new: list[str] = Field(
+        ..., description="已查回档案的新区（含查回数全为 0 的档案）"
+    )
+    unretrieved_new: list[str] = Field(
+        ..., description="尚未查回档案的新区；注意与「已查回但计数为 0」不同"
+    )
     old_remaining: dict[str, int]
     message: str
 

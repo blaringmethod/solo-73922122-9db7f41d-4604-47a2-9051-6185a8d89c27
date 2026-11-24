@@ -125,6 +125,8 @@ def get_plan(period_code: str, conn: sqlite3.Connection = Depends(get_conn)):
                 plan=[],
                 total_fee=0,
                 registered=_registered_out(data, registered=data.registered),
+                retrieved_new=_retrieved_new_out(data),
+                unretrieved_new=_unretrieved_new_out(data),
                 old_remaining={o: int(s["remaining"]) for o, s in bad_state.items()},
                 message=f"当前登记与底账不相容：{exc.detail}；失败登记已保留，请处理后重试",
             )
@@ -138,9 +140,21 @@ def get_plan(period_code: str, conn: sqlite3.Connection = Depends(get_conn)):
             plan=plan,
             total_fee=total_fee,
             registered=_registered_out(data, registered=registered),
+            retrieved_new=_retrieved_new_out(data),
+            unretrieved_new=_unretrieved_new_out(data),
             old_remaining={o: int(s["remaining"]) for o, s in state.items()},
             message=message,
         )
+
+
+def _retrieved_new_out(data: services.PeriodData) -> list[str]:
+    """已查回的档案（含查回数全为 0 的档案）；按底账顺序。"""
+    return [n for n in data.new_codes if n in data.registered]
+
+
+def _unretrieved_new_out(data: services.PeriodData) -> list[str]:
+    """尚未查回的档案（注意与「查回为零」不同）；按底账顺序。"""
+    return [n for n in data.new_codes if n not in data.registered]
 
 
 def _registered_out(
@@ -178,6 +192,8 @@ def get_accounting(period_code: str, conn: sqlite3.Connection = Depends(get_conn
                     o: int(s["remaining"])
                     for o, s in services._old_state(data, data.registered).items()
                 },
+                retrieved_new=_retrieved_new_out(data),
+                unretrieved_new=_unretrieved_new_out(data),
                 message=f"登记与底账不相容：{exc.detail}",
             )
 
@@ -191,6 +207,8 @@ def get_accounting(period_code: str, conn: sqlite3.Connection = Depends(get_conn
                 plan=plan,
                 total_fee=total_fee,
                 old_remaining={o: int(s["remaining"]) for o, s in state.items()},
+                retrieved_new=_retrieved_new_out(data),
+                unretrieved_new=_unretrieved_new_out(data),
                 message="仍需调档，先按 /plan 名单登记查回数",
             )
 
@@ -213,6 +231,8 @@ def get_accounting(period_code: str, conn: sqlite3.Connection = Depends(get_conn
             plan=[],
             total_fee=0,
             old_remaining={o: 0 for o in data.old_codes},
+            retrieved_new=_retrieved_new_out(data),
+            unretrieved_new=_unretrieved_new_out(data),
             message=note,
         )
 
@@ -240,6 +260,8 @@ def post_retrieval(
             plan=plan,
             total_fee=total_fee,
             registered=_registered_out(data, registered=registered),
+            retrieved_new=_retrieved_new_out(data),
+            unretrieved_new=_unretrieved_new_out(data),
             old_remaining={o: int(s["remaining"]) for o, s in state.items()},
             message="登记成功" + (
                 "，已无需再调档" if status == "completed" else "，请继续按名单调档"

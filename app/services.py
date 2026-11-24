@@ -50,20 +50,28 @@ class Edge:
 
 @dataclass
 class PeriodData:
+    period_id: int
     code: str
     name: str
     old_codes: list[str]
+    old_ids: dict[str, int]
     old_names: dict[str, str]
     old_completed: dict[str, int]
     new_codes: list[str]
+    new_ids: dict[str, int]
     new_names: dict[str, str]
     new_fee: dict[str, int]
     # old_code -> [(new_code, total)]
     old_edges: dict[str, list[tuple[str, int]]]
     # new_code -> {old_code: total}
     new_edges: dict[str, dict[str, int]]
-    # new_code -> {old_code: registered completed count}
+    # 合并两种存储格式后的有效登记：new_code -> {old_code: registered count}
+    # 已登记新区的每个重叠范围都有值（含 0），未登记新区不出现。
     registered: dict[str, dict[str, int]]
+    # 旧格式（逐范围一行，含零）档案，仅用于同值重送时转存
+    legacy_registered: dict[str, dict[str, int]]
+    # 新压缩格式（档头 + 非零明细）档案
+    archive_registered: dict[str, dict[str, int]]
 
 
 def _load_period(conn: sqlite3.Connection, period_code: str) -> PeriodData:
@@ -75,11 +83,13 @@ def _load_period(conn: sqlite3.Connection, period_code: str) -> PeriodData:
     pid = prow["id"]
 
     old_rows = conn.execute(
-        "SELECT code, name, completed FROM old_district WHERE period_id = ? ORDER BY id",
+        "SELECT id, code, name, completed FROM old_district "
+        "WHERE period_id = ? ORDER BY id",
         (pid,),
     ).fetchall()
     new_rows = conn.execute(
-        "SELECT code, name, fee FROM new_district WHERE period_id = ? ORDER BY id",
+        "SELECT id, code, name, fee FROM new_district "
+        "WHERE period_id = ? ORDER BY id",
         (pid,),
     ).fetchall()
     overlap_rows = conn.execute(
@@ -93,7 +103,7 @@ def _load_period(conn: sqlite3.Connection, period_code: str) -> PeriodData:
         """,
         (pid,),
     ).fetchall()
-    retrieval_rows = conn.execute(
+    legacy_rows = conn.execute(
         """
         SELECT n.code AS new_code, o.code AS old_code, r.completed_count
         FROM retrieval r
@@ -101,6 +111,19 @@ def _load_period(conn: sqlite3.Connection, period_code: str) -> PeriodData:
         JOIN old_district o ON o.id = r.old_district_id
         WHERE r.period_id = ?
         ORDER BY r.id
+        """,
+        (pid,),
+    ).fetchall()
+    # 压缩档案：档头一行 + 非零明细。LEFT JOIN 让全零档案也能读出档头。
+    archive_rows = conn.execute(
+        """
+        SELECT n.code AS new_code, o.code AS old_code, d.completed_count
+        FROM retrieval_archive a
+        JOIN new_district n ON n.id = a.new_district_id
+        LEFT JOIN retrieval_detail d ON d.archive_id = a.id
+        LEFT JOIN old_district o ON o.id = d.old_district_id
+        WHERE a.period_id = ?
+        ORDER BY a.id, d.id
         """,
         (pid,),
     ).fetchall()
@@ -113,22 +136,48 @@ def _load_period(conn: sqlite3.Connection, period_code: str) -> PeriodData:
         old_edges[r["old_code"]].append((r["new_code"], r["building_total"]))
         new_edges[r["new_code"]][r["old_code"]] = r["building_total"]
 
-    registered: dict[str, dict[str, int]] = {}
-    for r in retrieval_rows:
-        registered.setdefault(r["new_code"], {})[r["old_code"]] = r["completed_count"]
+    # 旧格式：每个范围一行（含 0）；缺失范围按 0 补齐，语义与旧版一致
+    legacy_registered: dict[str, dict[str, int]] = {}
+    for r in legacy_rows:
+        legacy_registered.setdefault(r["new_code"], {})[r["old_code"]] = r[
+            "completed_count"
+        ]
+    for ncode, counts in legacy_registered.items():
+        for old_code in new_edges.get(ncode, {}):
+            counts.setdefault(old_code, 0)
+
+    # 新格式：档头出现即视为已登记，范围明细缺省即 0 -> 全零档案仍算已登记
+    archive_registered: dict[str, dict[str, int]] = {}
+    for r in archive_rows:
+        ncode = r["new_code"]
+        if ncode not in archive_registered:
+            archive_registered[ncode] = {o: 0 for o in new_edges.get(ncode, {})}
+        if r["old_code"] is not None:
+            archive_registered[ncode][r["old_code"]] = r["completed_count"]
+
+    # 两种格式可同库共存；同一新区若同时存在，以压缩档案为准
+    registered: dict[str, dict[str, int]] = {
+        n: dict(v) for n, v in legacy_registered.items()
+    }
+    registered.update({n: dict(v) for n, v in archive_registered.items()})
 
     return PeriodData(
+        period_id=pid,
         code=prow["code"],
         name=prow["name"],
         old_codes=old_codes,
+        old_ids={r["code"]: r["id"] for r in old_rows},
         old_names={r["code"]: r["name"] for r in old_rows},
         old_completed={r["code"]: r["completed"] for r in old_rows},
         new_codes=new_codes,
+        new_ids={r["code"]: r["id"] for r in new_rows},
         new_names={r["code"]: r["name"] for r in new_rows},
         new_fee={r["code"]: r["fee"] for r in new_rows},
         old_edges=old_edges,
         new_edges=new_edges,
         registered=registered,
+        legacy_registered=legacy_registered,
+        archive_registered=archive_registered,
     )
 
 
@@ -215,11 +264,16 @@ def register_retrieval(
 ) -> dict[str, dict[str, int]]:
     """登记一份新区档案。
 
+    存储：压缩格式「一份档案一行档头 + 仅非零范围明细」。
+    全零档案只落档头一行，仍算已登记；查档时按重叠范围补零返回原数。
+
     校验（全部在同一个 BEGIN IMMEDIATE 事务内）：
     1. 新区存在，且 keys 恰好等于该新区涉及的全部旧区；
     2. 各查回数 0 <= x <= 重叠楼栋总数；
     3. 合入后各旧区：已查总数 <= 底账，且完工余数能由未查楼栋凑足；
-    4. 同新区同值重送幂等成功，异值退回（409，原记录保留）。
+    4. 同新区同值重送幂等成功，异值退回（409，原记录保留）；
+       旧格式档案同值重送时转存为压缩格式（只转存这一份）。
+    5. 转存失败整体回滚，旧档案原样保留，仍可查到。
     """
     with immediate_transaction(conn):
         data = _load_period(conn, period_code)
@@ -249,12 +303,14 @@ def register_retrieval(
                     f"楼栋总数 {total}",
                 )
 
+        new_code = payload.new_code
+        submitted = dict(payload.counts)
         # 规则 4：同新区重送，相同结果幂等，异值冲突
-        previous = data.registered.get(payload.new_code)
-        if previous is not None and previous != dict(payload.counts):
+        previous = data.registered.get(new_code)
+        if previous is not None and previous != submitted:
             raise AppError(
                 409,
-                f"新区 {payload.new_code} 已登记不同结果 {previous}，"
+                f"新区 {new_code} 已登记不同结果 {previous}，"
                 f"异值退回，原记录保留",
             )
 
@@ -262,30 +318,54 @@ def register_retrieval(
         merged: dict[str, dict[str, int]] = {
             n: dict(v) for n, v in data.registered.items()
         }
-        merged[payload.new_code] = dict(payload.counts)
+        merged[new_code] = submitted
 
         _check_feasible(data, merged)
 
         if previous is None:
-            pid = conn.execute(
-                "SELECT id FROM period WHERE code = ?", (period_code,)
-            ).fetchone()["id"]
-            nid = conn.execute(
-                "SELECT id FROM new_district WHERE period_id = ? AND code = ?",
-                (pid, payload.new_code),
-            ).fetchone()["id"]
-            for old_code, value in payload.counts.items():
-                oid = conn.execute(
-                    "SELECT id FROM old_district WHERE period_id = ? AND code = ?",
-                    (pid, old_code),
-                ).fetchone()["id"]
+            _insert_archive(conn, data, new_code, submitted)
+        elif new_code in data.legacy_registered:
+            # 旧档案同值重送：只把这一份转存为压缩格式。
+            # 整个过程在同一写事务内；任何一步失败都会回滚，旧档案仍在。
+            if new_code in data.archive_registered:
+                # 防御：同库两种格式同时存在时压缩档案为准，只清理旧格式，
+                # 绝不改动已提交的压缩档案（避免覆盖并发新登记的档案）。
                 conn.execute(
-                    "INSERT INTO retrieval(period_id, new_district_id, old_district_id, "
-                    "completed_count) VALUES (?, ?, ?, ?)",
-                    (pid, nid, oid, value),
+                    "DELETE FROM retrieval "
+                    "WHERE period_id = ? AND new_district_id = ?",
+                    (data.period_id, data.new_ids[new_code]),
                 )
-        # previous 相同：幂等重送，不重复写入
+            else:
+                _insert_archive(conn, data, new_code, previous)
+                conn.execute(
+                    "DELETE FROM retrieval "
+                    "WHERE period_id = ? AND new_district_id = ?",
+                    (data.period_id, data.new_ids[new_code]),
+                )
+        # 压缩格式档案同值重送：幂等，不重复写入
         return merged
+
+
+def _insert_archive(
+    conn: sqlite3.Connection,
+    data: PeriodData,
+    new_code: str,
+    counts: dict[str, int],
+) -> None:
+    """写入一份压缩档案：档头一行 + 仅非零范围明细（零值不落库）。"""
+    cur = conn.execute(
+        "INSERT INTO retrieval_archive(period_id, new_district_id) VALUES (?, ?)",
+        (data.period_id, data.new_ids[new_code]),
+    )
+    archive_id = cur.lastrowid
+    for old_code, value in counts.items():
+        if value == 0:
+            continue
+        conn.execute(
+            "INSERT INTO retrieval_detail(archive_id, old_district_id, "
+            "completed_count) VALUES (?, ?, ?)",
+            (archive_id, data.old_ids[old_code], value),
+        )
 
 
 def _old_state(
@@ -453,10 +533,19 @@ def solve_completed(
 
 
 def reset_retrievals(conn: sqlite3.Connection, period_code: str) -> None:
+    """清空该期档案：旧格式与新压缩格式一并清空。"""
     with immediate_transaction(conn):
         prow = conn.execute(
             "SELECT id FROM period WHERE code = ?", (period_code,)
         ).fetchone()
         if prow is None:
             raise AppError(404, f"期次不存在: {period_code}")
-        conn.execute("DELETE FROM retrieval WHERE period_id = ?", (prow["id"],))
+        pid = prow["id"]
+        # 先删明细再删档头（显式顺序，不依赖级联）；另一条语句清旧格式。
+        conn.execute(
+            "DELETE FROM retrieval_detail WHERE archive_id IN "
+            "(SELECT id FROM retrieval_archive WHERE period_id = ?)",
+            (pid,),
+        )
+        conn.execute("DELETE FROM retrieval_archive WHERE period_id = ?", (pid,))
+        conn.execute("DELETE FROM retrieval WHERE period_id = ?", (pid,))

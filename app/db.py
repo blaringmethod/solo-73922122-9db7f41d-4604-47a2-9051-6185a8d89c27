@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS overlap (
     UNIQUE (period_id, new_district_id, old_district_id)
 );
 
+-- 旧版（逐范围）档案格式。保留以兼容已经落库的旧档案：
+-- 每个范围一行，零计数也会占一行。新登记不再写入此表。
 CREATE TABLE IF NOT EXISTS retrieval (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     period_id         INTEGER NOT NULL REFERENCES period(id) ON DELETE CASCADE,
@@ -57,6 +59,24 @@ CREATE TABLE IF NOT EXISTS retrieval (
     completed_count   INTEGER NOT NULL CHECK (completed_count >= 0),
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (period_id, new_district_id, old_district_id)
+);
+
+-- 新版压缩档案：一份档案一行头记录。全零档案只有这一行，仍算已登记。
+CREATE TABLE IF NOT EXISTS retrieval_archive (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_id         INTEGER NOT NULL REFERENCES period(id) ON DELETE CASCADE,
+    new_district_id   INTEGER NOT NULL REFERENCES new_district(id) ON DELETE CASCADE,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (period_id, new_district_id)
+);
+
+-- 压缩档案的非零范围明细：零计数不落库，读出时按重叠范围补零。
+CREATE TABLE IF NOT EXISTS retrieval_detail (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    archive_id        INTEGER NOT NULL REFERENCES retrieval_archive(id) ON DELETE CASCADE,
+    old_district_id   INTEGER NOT NULL REFERENCES old_district(id) ON DELETE CASCADE,
+    completed_count   INTEGER NOT NULL CHECK (completed_count > 0),
+    UNIQUE (archive_id, old_district_id)
 );
 """
 
